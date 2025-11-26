@@ -13,8 +13,13 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import HTMLResponse, FileResponse
-
+from fastapi.staticfiles import StaticFiles
 from transformers import Sam3Processor, Sam3Model
+import io
+import zipfile
+from fastapi.responses import StreamingResponse
+
+
 
 # -----------------------------
 # Device + model init
@@ -44,7 +49,8 @@ HITS_DIR.mkdir(exist_ok=True)
 SESSION_MAX_AGE_DAYS = 3
 
 app = FastAPI(title="SAM3 Frame-based CCTV Search")
-
+# Serve hits/ so we can show hit images directly in the browser
+app.mount("/hits_static", StaticFiles(directory=str(HITS_DIR)), name="hits_static")
 
 def slugify_query(text_query: str) -> str:
     """Turn a query into a safe folder name like 'black_car'."""
@@ -67,34 +73,42 @@ def apply_mask_overlay(
 ) -> np.ndarray:
     """
     Take an RGB frame and [K, H, W] masks, plus scores, and return a BGR image
-    with a light red transparent overlay + per-object boxes and labels.
+    with a light red transparent overlay + per-object boxes + per-object labels.
 
     Each detected object gets:
-      - its own soft red mask
+      - its own soft red tint
       - its own bounding box
-      - its own label like "black car (0.87)" drawn INSIDE the box
+      - a label like "black car (0.87)" drawn near the top-left of the box
     """
-    image = Image.fromarray(frame_rgb).convert("RGBA")
+    # Convert RGB -> BGR for OpenCV drawing
+    frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
 
     # masks: [K, H, W] -> boolean
-    masks_np = (masks.detach().cpu().numpy() > 0.5)  # [K, H, W] bool
+    masks_np = (masks.detach().cpu().numpy() > 0.5)  # [K, H, W]
     scores_np = scores.detach().cpu().numpy()        # [K]
 
-    draw = ImageDraw.Draw(image)
-    try:
-        font = ImageFont.load_default()
-    except Exception:
-        font = None
+    # Start with a copy for the tinted overlay
+    overlay = frame_bgr.copy()
 
+    # --- First pass: apply light red tint over each mask ---
+    for mask_bool in masks_np:
+        # Light red color in BGR
+        color = (0, 0, 255)
+        # Apply color only where mask is True
+        overlay[mask_bool] = color
+
+    # Blend overlay with original for transparency
+    alpha = 0.3  # 0.0 = no tint, 1.0 = solid red
+    blended = cv2.addWeighted(overlay, alpha, frame_bgr, 1 - alpha, 0)
+
+    h, w = blended.shape[:2]
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.35  # smaller text so it covers less of the object
+    thickness = 1      # keep the outline thin
+
+
+    # --- Second pass: draw box + label for each object ---
     for i, mask_bool in enumerate(masks_np):
-        # -------- soft overlay (light red) --------
-        mask_img = Image.fromarray((mask_bool.astype("uint8") * 255))
-        overlay = Image.new("RGBA", image.size, (255, 0, 0, 0))  # red
-        # alpha=80 → very transparent red tint, object still visible
-        overlay.putalpha(mask_img.point(lambda v: 80 if v > 0 else 0))
-        image = Image.alpha_composite(image, overlay)
-
-        # -------- bounding box for this object --------
         ys, xs = np.where(mask_bool)
         if ys.size == 0 or xs.size == 0:
             continue
@@ -102,64 +116,41 @@ def apply_mask_overlay(
         x_min, x_max = int(xs.min()), int(xs.max())
         y_min, y_max = int(ys.min()), int(ys.max())
 
-        draw.rectangle(
-            [(x_min, y_min), (x_max, y_max)],
-            outline=(255, 0, 0, 255),
-            width=3,
-        )
+        # Draw bounding box
+        cv2.rectangle(blended, (x_min, y_min), (x_max, y_max), (0, 0, 255), 2)
 
-        # -------- label text for this object --------
+        # Label text, e.g. "black car (0.87)"
         score_val = float(scores_np[i])
-        # e.g. "black car (0.87)"
-        text = f"{label_text} ({score_val:.2f})"
+        label = f"{label_text} ({score_val:.2f})"
 
-        if font is not None:
-            text_bbox = draw.textbbox((0, 0), text, font=font)
-            text_w = text_bbox[2] - text_bbox[0]
-            text_h = text_bbox[3] - text_bbox[1]
-        else:
-            text_w, text_h = draw.textlength(text), 14  # fallback
+        # Measure text size
+        (text_w, text_h), baseline = cv2.getTextSize(label, font, font_scale, thickness)
 
-        pad = 4
+        # Place label just inside the top-left corner of the box
+        text_x = x_min + 3
+        text_y = max(y_min + text_h + 3, text_h + 3)
 
-        # Place label INSIDE the box at the top-left corner
-        label_left = x_min + 1
-        label_top = y_min + 1
-        label_right = label_left + text_w + 2 * pad
-        label_bottom = label_top + text_h + 2 * pad
+        # Background rectangle for the label (tighter padding)
+        bg_x1 = max(text_x - 2, 0)
+        bg_y1 = max(text_y - text_h - 3, 0)
+        bg_x2 = min(text_x + text_w + 2, w - 1)
+        bg_y2 = min(text_y + 1, h - 1)
 
-        # Clamp label inside image bounds
-        img_w, img_h = image.size
-        if label_right > img_w:
-            shift = label_right - img_w
-            label_left -= shift
-            label_right -= shift
-        if label_bottom > img_h:
-            shift = label_bottom - img_h
-            label_top -= shift
-            label_bottom -= shift
+        cv2.rectangle(blended, (bg_x1, bg_y1), (bg_x2, bg_y2), (0, 0, 255), thickness=-1)
 
-        # Solid background so text is readable even over video
-        draw.rectangle(
-            [(label_left, label_top), (label_right, label_bottom)],
-            fill=(255, 0, 0, 220),
-        )
-
-        text_x = label_left + pad
-        text_y = label_top + pad
-
-        # Draw label text (white)
-        draw.text(
+        # Draw white text on top
+        cv2.putText(
+            blended,
+            label,
             (text_x, text_y),
-            text,
-            fill=(255, 255, 255, 255),
-            font=font,
+            font,
+            font_scale,
+            (255, 255, 255),
+            thickness,
+            cv2.LINE_AA,
         )
 
-    # Back to BGR for OpenCV
-    image_rgb = image.convert("RGB")
-    image_bgr = cv2.cvtColor(np.array(image_rgb), cv2.COLOR_RGB2BGR)
-    return image_bgr
+    return blended
 
 def sam3_highlight_frame(
     frame_rgb: np.ndarray,
@@ -348,6 +339,9 @@ def search_video_for_concept(
                     h["image_path"].name,
                 ]
             )
+    # Build preview video from hit images (stop-motion style)
+    preview_video_path = build_preview_video_from_hits(hits, session_dir, fps=3)
+
 
     return {
         "fps": fps,
@@ -360,8 +354,67 @@ def search_video_for_concept(
         "query_slug": query_slug,
         "session_id": session_id,
         "csv_path": csv_path,
+        "preview_video_path": preview_video_path,
     }
 
+def build_preview_video_from_hits(
+    hits: List[Dict[str, Any]],
+    session_dir: Path,
+    fps: int = 3,
+    filename: str = "preview.mp4",
+) -> Optional[Path]:
+    """
+    Build a stop-motion style video from the hit images.
+
+    - hits: list of dicts with "image_path" and "frame_idx"
+    - session_dir: folder where images live
+    - fps: frames per second of the output video (3 = fairly slow)
+    Returns the path to the created video, or None if no valid frames.
+    """
+    if not hits:
+        return None
+
+    # Sort hits by frame index to keep chronological order
+    hits_sorted = sorted(hits, key=lambda h: h["frame_idx"])
+
+    # Read the first frame to get size
+    first_path: Path = hits_sorted[0]["image_path"]
+    if not first_path.is_file():
+        return None
+
+    first_frame = cv2.imread(str(first_path))
+    if first_frame is None:
+        return None
+
+    height, width = first_frame.shape[:2]
+
+    out_path = session_dir / filename
+
+    # Use a common codec: mp4v (works fine on macOS usually)
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(str(out_path), fourcc, fps, (width, height))
+
+    for h in hits_sorted:
+        img_path: Path = h["image_path"]
+        frame = cv2.imread(str(img_path))
+        if frame is None:
+            continue
+        # Ensure size matches the first frame
+        if frame.shape[1] != width or frame.shape[0] != height:
+            frame = cv2.resize(frame, (width, height))
+        writer.write(frame)
+
+    writer.release()
+
+    # If we ended up writing zero frames (unlikely), remove file and return None
+    if out_path.is_file() and out_path.stat().st_size > 0:
+        return out_path
+    else:
+        try:
+            out_path.unlink()
+        except OSError:
+            pass
+        return None
 
 # -----------------------------
 # HTML UI (dark theme + loading + clean sessions)
@@ -372,37 +425,37 @@ HTML_TEMPLATE = """
 <html>
 <head>
     <meta charset="UTF-8" />
-    <title>SAM3 CCTV Frame Search</title>
+    <title>SAM3 CCTV Search</title>
     <style>
-        :root {{
+        :root {
             color-scheme: dark;
-        }}
-        * {{
+        }
+        * {
             box-sizing: border-box;
-        }}
-        body {{
+        }
+        body {
             margin: 0;
             padding: 0;
             font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
             background: radial-gradient(circle at top, #0f172a 0, #020617 45%, #000 100%);
             color: #e5e7eb;
-        }}
-        .page {{
+        }
+        .page {
             max-width: 1180px;
             margin: 0 auto 4rem auto;
             padding: 1.8rem 1.4rem 3rem 1.4rem;
-        }}
-        .header {{
+        }
+        .header {
             display: flex;
             justify-content: space-between;
             align-items: center;
             margin-bottom: 1.2rem;
-        }}
-        .title {{
+        }
+        .title {
             font-size: 1.7rem;
             font-weight: 700;
-        }}
-        .badge {{
+        }
+        .badge {
             padding: 0.25rem 0.75rem;
             border-radius: 999px;
             background: rgba(56, 189, 248, 0.15);
@@ -410,38 +463,38 @@ HTML_TEMPLATE = """
             color: #7dd3fc;
             font-size: 0.78rem;
             font-weight: 600;
-        }}
-        .subtitle {{
+        }
+        .subtitle {
             color: #9ca3af;
             margin-bottom: 1.75rem;
             font-size: 0.9rem;
-        }}
-        .layout {{
+        }
+        .layout {
             display: grid;
             grid-template-columns: minmax(0, 340px) minmax(0, 1fr);
             gap: 1.5rem;
-        }}
-        @media (max-width: 900px) {{
-            .layout {{
+        }
+        @media (max-width: 900px) {
+            .layout {
                 grid-template-columns: minmax(0, 1fr);
-            }}
-        }}
-        .card {{
+            }
+        }
+        .card {
             background: radial-gradient(circle at top left, #111827 0, #020617 70%);
             border-radius: 18px;
             box-shadow: 0 18px 45px rgba(15, 23, 42, 0.7);
             border: 1px solid rgba(31, 41, 55, 0.9);
             position: relative;
             overflow: hidden;
-        }}
-        .card::before {{
+        }
+        .card::before {
             content: "";
             position: absolute;
             inset: 0;
             background: radial-gradient(circle at top left, rgba(56, 189, 248, 0.07) 0, transparent 50%);
             pointer-events: none;
-        }}
-        .card-header {{
+        }
+        .card-header {
             padding: 0.9rem 1.1rem 0.4rem 1.1rem;
             border-bottom: 1px solid rgba(31, 41, 55, 0.9);
             font-weight: 600;
@@ -449,23 +502,23 @@ HTML_TEMPLATE = """
             color: #e5e7eb;
             position: relative;
             z-index: 1;
-        }}
-        .card-body {{
+        }
+        .card-body {
             padding: 0.9rem 1.1rem 1.1rem 1.1rem;
             position: relative;
             z-index: 1;
-        }}
-        form label {{
+        }
+        form label {
             display: block;
             margin-top: 0.7rem;
             font-size: 0.8rem;
             font-weight: 600;
             color: #9ca3af;
-        }}
+        }
         input[type="text"],
         input[type="number"],
         input[type="file"],
-        select {{
+        select {
             width: 100%;
             padding: 0.45rem 0.6rem;
             margin-top: 0.25rem;
@@ -474,8 +527,8 @@ HTML_TEMPLATE = """
             font-size: 0.83rem;
             background: #020617;
             color: #e5e7eb;
-        }}
-        input::file-selector-button {{
+        }
+        input::file-selector-button {
             border-radius: 999px;
             border: none;
             padding: 0.3rem 0.8rem;
@@ -484,14 +537,14 @@ HTML_TEMPLATE = """
             color: #e5e7eb;
             font-size: 0.75rem;
             cursor: pointer;
-        }}
+        }
         input:focus,
-        select:focus {{
+        select:focus {
             outline: none;
             border-color: #60a5fa;
             box-shadow: 0 0 0 1px rgba(96, 165, 250, 0.4);
-        }}
-        button {{
+        }
+        button {
             margin-top: 0.9rem;
             padding: 0.6rem 1.25rem;
             border-radius: 999px;
@@ -501,26 +554,26 @@ HTML_TEMPLATE = """
             color: white;
             font-weight: 600;
             font-size: 0.9rem;
-        }}
-        button:hover {{
+        }
+        button:hover {
             background: linear-gradient(to right, #1d4ed8, #6d28d9);
-        }}
-        .btn-secondary {{
+        }
+        .btn-secondary {
             background: transparent;
             border: 1px solid #4b5563;
             color: #e5e7eb;
             padding: 0.45rem 1rem;
             font-size: 0.8rem;
-        }}
-        .btn-secondary:hover {{
+        }
+        .btn-secondary:hover {
             background: rgba(55, 65, 81, 0.4);
-        }}
-        .small {{
+        }
+        .small {
             font-size: 0.74rem;
             color: #6b7280;
             margin-top: 0.5rem;
-        }}
-        .message {{
+        }
+        .message {
             margin-top: 0.3rem;
             padding: 0.5rem 0.75rem;
             border-radius: 12px;
@@ -528,67 +581,66 @@ HTML_TEMPLATE = """
             border: 1px solid rgba(59, 130, 246, 0.6);
             color: #bfdbfe;
             font-size: 0.83rem;
-        }}
-        .error {{
+        }
+        .error {
             background: rgba(248, 113, 113, 0.16);
             border-color: rgba(248, 113, 113, 0.8);
             color: #fecaca;
-        }}
-        .summary-grid {{
+        }
+        .summary-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
             gap: 0.6rem;
             font-size: 0.8rem;
-        }}
-        .summary-item {{
+        }
+        .summary-item {
             background: rgba(15, 23, 42, 0.9);
             border-radius: 10px;
             padding: 0.5rem 0.65rem;
             border: 1px solid #1f2937;
-        }}
-        .summary-label {{
+        }
+        .summary-label {
             color: #9ca3af;
             font-size: 0.73rem;
-        }}
-        .summary-value {{
+        }
+        .summary-value {
             font-weight: 600;
             margin-top: 0.1rem;
-        }}
-        .results-grid {{
+        }
+        .results-grid {
             display: grid;
             grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
             gap: 1rem;
             margin-top: 1rem;
-        }}
-        .result-card {{
+        }
+        .result-card {
             border-radius: 12px;
             background-color: rgba(15, 23, 42, 0.95);
             border: 1px solid #1f2937;
             padding: 0.55rem;
             font-size: 0.83rem;
-        }}
-        .result-card img {{
+        }
+        .result-card img {
             width: 100%;
             border-radius: 10px;
             display: block;
             margin-bottom: 0.45rem;
             cursor: pointer;
-        }}
-        .result-meta {{
+        }
+        .result-meta {
             display: grid;
             grid-template-columns: repeat(2, minmax(0, 1fr));
             column-gap: 0.5rem;
             row-gap: 0.15rem;
-        }}
-        .meta-label {{
+        }
+        .meta-label {
             color: #9ca3af;
             font-size: 0.74rem;
-        }}
-        .meta-value {{
+        }
+        .meta-value {
             font-weight: 500;
-        }}
-        /* Modal for expanded image */
-        .modal {{
+        }
+        .modal {
             position: fixed;
             inset: 0;
             background: rgba(0, 0, 0, 0.88);
@@ -596,14 +648,14 @@ HTML_TEMPLATE = """
             align-items: center;
             justify-content: center;
             z-index: 9999;
-        }}
-        .modal img {{
+        }
+        .modal img {
             max-width: 90%;
             max-height: 90%;
             border-radius: 12px;
             box-shadow: 0 16px 50px rgba(0, 0, 0, 0.75);
-        }}
-        .csv-link {{
+        }
+        .csv-link {
             display: inline-flex;
             align-items: center;
             gap: 0.3rem;
@@ -611,18 +663,42 @@ HTML_TEMPLATE = """
             font-size: 0.8rem;
             color: #93c5fd;
             text-decoration: none;
-        }}
-        .csv-link:hover {{
+        }
+        .csv-link:hover {
             text-decoration: underline;
-        }}
-        .csv-icon {{
+        }
+        .csv-icon {
             font-size: 1rem;
-        }}
-        .maintenance-card {{
+        }
+        .maintenance-card {
             margin-top: 1rem;
-        }}
-        /* Loading overlay */
-        .loading-overlay {{
+        }
+        .preview-block {
+            margin-top: 0.9rem;
+        }
+        .slideshow-container {
+            width: 100%;
+            max-height: 360px;
+            border-radius: 12px;
+            border: 1px solid #1f2937;
+            background: #000;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+            margin-bottom: 0.4rem;
+        }
+        .slideshow-frame {
+            max-width: 100%;
+            max-height: 100%;
+            display: none;
+        }
+        .slideshow-controls {
+            display: flex;
+            gap: 0.5rem;
+            margin-top: 0.2rem;
+        }
+        .loading-overlay {
             position: fixed;
             inset: 0;
             background: rgba(0, 0, 0, 0.88);
@@ -632,44 +708,72 @@ HTML_TEMPLATE = """
             z-index: 10000;
             flex-direction: column;
             gap: 0.8rem;
-        }}
-        .spinner {{
+        }
+        .spinner {
             width: 40px;
             height: 40px;
             border-radius: 999px;
             border: 3px solid rgba(148, 163, 184, 0.4);
             border-top-color: #60a5fa;
             animation: spin 0.8s linear infinite;
-        }}
-        @keyframes spin {{
-            to {{ transform: rotate(360deg); }}
-        }}
-        .loading-text {{
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        .loading-text {
             font-size: 0.9rem;
             color: #e5e7eb;
-        }}
-        .loading-sub {{
+        }
+        .loading-sub {
             font-size: 0.75rem;
             color: #9ca3af;
-        }}
+        }
     </style>
     <script>
-        function openImage(src) {{
+        function openImage(src) {
             const modal = document.getElementById('imgModal');
             const modalImg = document.getElementById('modalImg');
             modalImg.src = src;
             modal.style.display = 'flex';
-        }}
-        function closeModal() {{
+        }
+        function closeModal() {
             const modal = document.getElementById('imgModal');
             modal.style.display = 'none';
-        }}
-        function showLoading() {{
+        }
+        function showLoading() {
             const overlay = document.getElementById('loadingOverlay');
-            if (overlay) {{
+            if (overlay) {
                 overlay.style.display = 'flex';
-            }}
-        }}
+            }
+        }
+
+        // --- Slideshow logic for hit preview ---
+        let slideshowTimer = null;
+        let slideshowIndex = 0;
+
+        function startSlideshow() {
+            const frames = document.querySelectorAll('.slideshow-frame');
+            if (!frames.length) return;
+
+            slideshowIndex = 0;
+            frames.forEach((img, i) => {
+                img.style.display = i === 0 ? 'block' : 'none';
+            });
+
+            if (slideshowTimer) clearInterval(slideshowTimer);
+            slideshowTimer = setInterval(() => {
+                frames[slideshowIndex].style.display = 'none';
+                slideshowIndex = (slideshowIndex + 1) % frames.length;
+                frames[slideshowIndex].style.display = 'block';
+            }, 333);
+        }
+
+        function stopSlideshow() {
+            if (slideshowTimer) {
+                clearInterval(slideshowTimer);
+                slideshowTimer = null;
+            }
+        }
     </script>
 </head>
 <body>
@@ -739,12 +843,10 @@ HTML_TEMPLATE = """
         </div>
     </div>
 
-    <!-- Modal for expanded image -->
     <div id="imgModal" class="modal" onclick="closeModal()">
         <img id="modalImg" src="" alt="expanded frame" />
     </div>
 
-    <!-- Loading overlay (progress indicator) -->
     <div id="loadingOverlay" class="loading-overlay">
         <div class="spinner"></div>
         <div class="loading-text">Processing video with SAM3…</div>
@@ -756,10 +858,11 @@ HTML_TEMPLATE = """
 
 
 def render_page(message_block: str = "", results_block: str = "") -> str:
-    return HTML_TEMPLATE.format(
-        message_block=message_block,
-        results_block=results_block,
-    )
+    html = HTML_TEMPLATE
+    html = html.replace("{message_block}", message_block)
+    html = html.replace("{results_block}", results_block)
+    return html
+
 
 
 # -----------------------------
@@ -785,6 +888,55 @@ async def download_csv(query_slug: str, session_id: str):
         media_type="text/csv",
     )
 
+@app.get("/download_preview", response_class=FileResponse)
+async def download_preview(query_slug: str, session_id: str):
+    """
+    Serve the hit-preview video for a given query/session.
+    """
+    video_path = HITS_DIR / query_slug / session_id / "preview.mp4"
+    if not video_path.is_file():
+        raise HTTPException(status_code=404, detail="Preview video not found.")
+    # No filename argument → browser treats it as inline media
+    return FileResponse(
+        path=video_path,
+        media_type="video/mp4",
+    )
+
+@app.get("/download_hits_zip")
+async def download_hits_zip(query_slug: str, session_id: str):
+    """
+    Download all hit images (and results.csv if present) for a given query/session as a ZIP.
+    """
+    session_dir = HITS_DIR / query_slug / session_id
+    if not session_dir.is_dir():
+        raise HTTPException(status_code=404, detail="Session not found.")
+
+    # Collect files: all .jpg/.jpeg/.png + results.csv
+    files = []
+    for p in session_dir.iterdir():
+        if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png"}:
+            files.append(p)
+    csv_path = session_dir / "results.csv"
+    if csv_path.is_file():
+        files.append(csv_path)
+
+    if not files:
+        raise HTTPException(status_code=404, detail="No hit files found to download.")
+
+    # Build ZIP in memory
+    zip_bytes = io.BytesIO()
+    with zipfile.ZipFile(zip_bytes, "w", zipfile.ZIP_DEFLATED) as zf:
+        for f in files:
+            # Save inside ZIP with just the filename, not full path
+            zf.write(f, arcname=f.name)
+    zip_bytes.seek(0)
+
+    filename = f"{query_slug}_{session_id}_hits.zip"
+    return StreamingResponse(
+        zip_bytes,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 @app.post("/clean_sessions", response_class=HTMLResponse)
 async def clean_sessions() -> str:
@@ -819,7 +971,6 @@ async def clean_sessions() -> str:
 
     message_block = f'<div class="message">{message}</div>'
     return render_page(message_block=message_block)
-
 
 @app.post("/search", response_class=HTMLResponse)
 async def search(
@@ -886,13 +1037,94 @@ async def search(
             message_block = f'<div class="message error">{message}</div>'
             return render_page(message_block=message_block)
 
-        # Summary block
+        # Summary stats
         total_hits = len(hits)
         processed_est = max(1, results["total_frames"] // max(1, results["frame_step"]))
         total_objects = sum(h.get("num_objects", 0) for h in hits)
         all_scores = [s for h in hits for s in h.get("scores", [])]
         avg_score = sum(all_scores) / len(all_scores) if all_scores else 0.0
 
+        # Cards + slideshow frames
+        cards = []
+        slideshow_frames = []
+
+        for h in hits:
+            t = h["time_sec"]
+            mm = int(t // 60)
+            ss = t % 60
+            timestamp = f"{mm:02d}:{ss:05.2f}"
+
+            img_path: Path = h["image_path"]
+            scores = h.get("scores", [])
+            num_objects = h.get("num_objects", len(scores))
+            scores_str = ", ".join(f"{s:.2f}" for s in scores)
+
+            # Static URL for slideshow (served from /hits_static)
+            web_img_src = f"/hits_static/{query_slug}/{session_id}/{img_path.name}"
+
+            # Base64 thumbnail for the card
+            with open(img_path, "rb") as f:
+                img_bytes = f.read()
+            img_b64 = base64.b64encode(img_bytes).decode("ascii")
+            img_src = f"data:image/jpeg;base64,{img_b64}"
+
+            # Add to slideshow
+            slideshow_frames.append(
+                f'<img src="{web_img_src}" class="slideshow-frame" />'
+            )
+
+            # Per-frame card
+            cards.append(
+                f"""
+                <div class="result-card">
+                    <img src="{img_src}" alt="frame {h['frame_idx']}" onclick="openImage('{img_src}')" />
+                    <div class="result-meta">
+                        <div>
+                            <div class="meta-label">Frame</div>
+                            <div class="meta-value">{h['frame_idx']}</div>
+                        </div>
+                        <div>
+                            <div class="meta-label">Time</div>
+                            <div class="meta-value">{timestamp}</div>
+                        </div>
+                        <div>
+                            <div class="meta-label"># Objects</div>
+                            <div class="meta-value">{num_objects}</div>
+                        </div>
+                        <div>
+                            <div class="meta-label">Scores</div>
+                            <div class="meta-value">{scores_str}</div>
+                        </div>
+                    </div>
+                    <div class="small">Saved in: hits/{query_slug}/{session_id}/</div>
+                </div>
+                """
+            )
+
+        # Slideshow preview block (stop-motion style)
+        slideshow_html = ""
+        if slideshow_frames:
+            frames_joined = "".join(slideshow_frames)
+            hits_zip_url = f"/download_hits_zip?query_slug={query_slug}&session_id={session_id}"
+            slideshow_html = f"""
+                <div class="preview-block">
+                    <div class="summary-label" style="margin-bottom: 0.25rem;">Hit preview (slideshow)</div>
+                    <div class="slideshow-container">
+                        {frames_joined}
+                    </div>
+                    <div class="slideshow-controls">
+                        <button type="button" class="btn-secondary" onclick="startSlideshow()">Play</button>
+                        <button type="button" class="btn-secondary" onclick="stopSlideshow()">Pause</button>
+                    </div>
+                    <a class="csv-link" href="{hits_zip_url}">
+                        <span class="csv-icon">📦</span>
+                        <span>Download slideshow frames (.zip)</span>
+                    </a>
+                    <div class="small">This is a fast slideshow of hit frames (≈ stop-motion preview).</div>
+                </div>
+            """
+
+        # Run summary card
         summary_html = f"""
         <div class="card" style="margin-bottom: 1rem;">
             <div class="card-header">Run summary</div>
@@ -935,55 +1167,12 @@ async def search(
                     <span class="csv-icon">📄</span>
                     <span>Download CSV summary</span>
                 </a>
+                {slideshow_html}
             </div>
         </div>
         """
 
-        # Per-frame cards
-        cards = []
-        for h in hits:
-            t = h["time_sec"]
-            mm = int(t // 60)
-            ss = t % 60
-            timestamp = f"{mm:02d}:{ss:05.2f}"
-
-            img_path: Path = h["image_path"]
-            scores = h.get("scores", [])
-            num_objects = h.get("num_objects", len(scores))
-            scores_str = ", ".join(f"{s:.2f}" for s in scores)
-
-            with open(img_path, "rb") as f:
-                img_bytes = f.read()
-            img_b64 = base64.b64encode(img_bytes).decode("ascii")
-            img_src = f"data:image/jpeg;base64,{img_b64}"
-
-            cards.append(
-                f"""
-                <div class="result-card">
-                    <img src="{img_src}" alt="frame {h['frame_idx']}" onclick="openImage('{img_src}')" />
-                    <div class="result-meta">
-                        <div>
-                            <div class="meta-label">Frame</div>
-                            <div class="meta-value">{h['frame_idx']}</div>
-                        </div>
-                        <div>
-                            <div class="meta-label">Time</div>
-                            <div class="meta-value">{timestamp}</div>
-                        </div>
-                        <div>
-                            <div class="meta-label"># Objects</div>
-                            <div class="meta-value">{num_objects}</div>
-                        </div>
-                        <div>
-                            <div class="meta-label">Scores</div>
-                            <div class="meta-value">{scores_str}</div>
-                        </div>
-                    </div>
-                    <div class="small">Saved in: hits/{query_slug}/{session_id}/</div>
-                </div>
-                """
-            )
-
+        # Results grid
         grid_html = (
             summary_html
             + '<div class="card"><div class="card-header">Matching frames</div>'
@@ -995,7 +1184,7 @@ async def search(
 
         message_block = (
             '<div class="message">'
-            "Search completed. You can download a CSV summary, or click any image to see it larger. "
+            "Search completed. You can use the slideshow preview or click any image to see it larger. "
             "Red overlays and labels show each detected match and its confidence."
             "</div>"
         )
